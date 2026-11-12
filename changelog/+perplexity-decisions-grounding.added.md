@@ -1,0 +1,1 @@
+- Added `web_grounding` to `PerplexityDecisionsClassifier` and `PerplexityDecisionsClient`: Perplexity searches the web before answering, and the classifier reports the pages it read through a new `on_search_results` event. `PerplexityDecisionsClient.request()` returns the whole reply, pages included, and `max_staleness` bounds the age of a page fetched from a URL-only state.

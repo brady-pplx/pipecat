@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from pipecat.classifiers.base_classifier import ClassifierError
 from pipecat.utils.network import exponential_backoff_time
@@ -63,6 +63,41 @@ class PerplexityDecisionsUsage(BaseModel):
     output_tokens: int = 0
 
 
+class PerplexitySearchResult(BaseModel):
+    """A web page Perplexity read before answering, with ``web_grounding``.
+
+    Parameters:
+        title: The page title.
+        url: The page address.
+        snippet: The part of the page the model read.
+        date: When the page was published, when Perplexity knows it.
+        last_updated: When the page last changed, when Perplexity knows it.
+    """
+
+    title: str = ""
+    url: str
+    snippet: str = ""
+    date: str | None = None
+    last_updated: str | None = None
+
+
+class PerplexityDecisionsReply(BaseModel):
+    """Perplexity's reply to one request.
+
+    Parameters:
+        answers: The answers by question name, in Perplexity's own format.
+        usage: The tokens the request used.
+        search_results: The pages a web search found, with ``web_grounding``.
+        fetched_results: The page fetched from a URL in the state, with
+            ``web_grounding``.
+    """
+
+    answers: dict[str, dict[str, Any]]
+    usage: PerplexityDecisionsUsage
+    search_results: list[PerplexitySearchResult] = []
+    fetched_results: list[PerplexitySearchResult] = []
+
+
 class PerplexityDecisionsClient:
     """HTTP client for Perplexity's ``/v1/decisions`` endpoint.
 
@@ -75,6 +110,10 @@ class PerplexityDecisionsClient:
     request, retries included, by ``timeout``. Counts the tokens every request
     used in :attr:`usage`. Errors carry the reason Perplexity gave.
 
+    With ``web_grounding``, Perplexity searches the web for each question
+    before the model answers, which adds up to about three seconds and is
+    billed per search. :meth:`request` returns the pages it read.
+
     The first question opens the connection, and :meth:`close` releases it.
     """
 
@@ -86,6 +125,8 @@ class PerplexityDecisionsClient:
         model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 3,
+        web_grounding: bool = False,
+        max_staleness: int | None = None,
     ):
         """Initialize the client.
 
@@ -101,12 +142,19 @@ class PerplexityDecisionsClient:
                 giving up.
             max_retries: How many times to retry a request that failed for a
                 reason that may pass, such as Perplexity being busy.
+            web_grounding: Whether to search the web for each question before
+                the model answers.
+            max_staleness: With ``web_grounding`` and a state that is only a
+                URL, the oldest copy of the page to use, in seconds since it
+                was fetched. ``None`` takes any stored copy.
         """
         if not api_key and base_url == DEFAULT_BASE_URL:
             raise ValueError("PerplexityDecisionsClient needs an API key")
         self._model = model
         self._timeout = timeout
         self._max_retries = max_retries
+        self._web_grounding = web_grounding
+        self._max_staleness = max_staleness
         self._usage = PerplexityDecisionsUsage()
         self._http = httpx.AsyncClient(
             base_url=base_url,
@@ -120,6 +168,11 @@ class PerplexityDecisionsClient:
     def model(self) -> str:
         """The decision model the questions go to."""
         return self._model
+
+    @property
+    def web_grounding(self) -> bool:
+        """Whether Perplexity searches the web before answering."""
+        return self._web_grounding
 
     @property
     def usage(self) -> PerplexityDecisionsUsage:
@@ -151,7 +204,32 @@ class PerplexityDecisionsClient:
                 it because it was busy, could not be reached, did not answer
                 in time, or left a question unanswered.
         """
+        reply = await self.request(state, questions)
+        return reply.answers, reply.usage
+
+    async def request(
+        self, state: str | dict[str, Any] | list[Any], questions: Mapping[str, dict[str, Any]]
+    ) -> PerplexityDecisionsReply:
+        """Send questions about one state and return Perplexity's whole reply.
+
+        Like :meth:`ask`, and with ``web_grounding`` the reply also holds the
+        pages Perplexity read.
+
+        Args:
+            state: What the questions are about, as for :meth:`ask`.
+            questions: The questions by name, as for :meth:`ask`.
+
+        Returns:
+            The answers, the tokens the request used, and any pages read.
+
+        Raises:
+            ClassifierError: As for :meth:`ask`.
+        """
         body: dict[str, Any] = {"model": self._model, "state": state, "questions": dict(questions)}
+        if self._web_grounding:
+            body["mode"] = "web_grounding"
+            if self._max_staleness is not None:
+                body["max_staleness"] = self._max_staleness
         try:
             async with asyncio.timeout(self._timeout):
                 data = await self._post(body)
@@ -159,6 +237,12 @@ class PerplexityDecisionsClient:
             raise ClassifierError(
                 f"Perplexity Decisions did not answer within {self._timeout:g}s"
             ) from e
+        return self._reply(data, questions)
+
+    def _reply(
+        self, data: dict[str, Any], questions: Mapping[str, Any]
+    ) -> PerplexityDecisionsReply:
+        """A reply's answers, usage and pages, counting its tokens."""
         usage = data.get("usage")
         request_usage = (
             PerplexityDecisionsUsage.model_validate(usage)
@@ -175,7 +259,29 @@ class PerplexityDecisionsClient:
             raise ClassifierError(
                 f"Perplexity Decisions reply has no answer for {', '.join(missing)}"
             )
-        return {name: answers[name] for name in questions}, request_usage
+        reply = PerplexityDecisionsReply(
+            answers={name: answers[name] for name in questions}, usage=request_usage
+        )
+        if self._web_grounding:
+            reply.search_results = self._pages(data.get("search_results"))
+            reply.fetched_results = self._pages(data.get("fetched_results"))
+        return reply
+
+    def _pages(self, pages: Any) -> list[PerplexitySearchResult]:
+        """The pages in a reply, leaving out any that are malformed.
+
+        A malformed page only loses its source, so it does not fail the
+        answers that came with it.
+        """
+        if not isinstance(pages, list):
+            return []
+        results = []
+        for page in pages:
+            try:
+                results.append(PerplexitySearchResult.model_validate(page))
+            except ValidationError:
+                logger.debug(f"Perplexity Decisions sent a malformed page: {page!r}")
+        return results
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
         """The reply to ``body`` as a JSON object, retrying while Perplexity is busy."""
