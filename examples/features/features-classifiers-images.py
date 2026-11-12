@@ -8,8 +8,8 @@
 
 By default the questions go to Jev; with ``--clef`` they go to Cloudflare's
 Clef, with ``--openai`` to OpenAI's Decisions API, with ``--google`` to
-Google's Decisions API, and with ``--llm`` to an OpenAI vision model through
-``LLMClassifier``.
+Google's Decisions API, with ``--perplexity`` to Perplexity's Decisions API,
+and with ``--llm`` to an OpenAI vision model through ``LLMClassifier``.
 
 Usage::
 
@@ -17,6 +17,7 @@ Usage::
     CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_KEY=... python features-classifiers-images.py --clef
     OPENAI_API_KEY=... python features-classifiers-images.py --openai
     GOOGLE_API_KEY=... python features-classifiers-images.py --google
+    PERPLEXITY_API_KEY=... python features-classifiers-images.py --perplexity
     OPENAI_API_KEY=... python features-classifiers-images.py --llm gpt-4.1-mini
 """
 
@@ -39,6 +40,7 @@ from pipecat.classifiers.cloudflare.clef.classifier import ClefClassifier
 from pipecat.classifiers.google.decisions.classifier import GoogleDecisionsClassifier
 from pipecat.classifiers.llm.classifier import LLMClassifier
 from pipecat.classifiers.openai.decisions.classifier import OpenAIDecisionsClassifier
+from pipecat.classifiers.perplexity.decisions.classifier import PerplexityDecisionsClassifier
 from pipecat.classifiers.typesafe.jev.classifier import JevClassifier
 from pipecat.frames.frames import ImageRawFrame
 from pipecat.services.openai.llm import OpenAILLMService
@@ -120,6 +122,13 @@ if __name__ == "__main__":
         const="gemini-decision-1",
         help="use Google's Decisions API instead of Jev",
     )
+    parser.add_argument(
+        "--perplexity",
+        metavar="MODEL",
+        nargs="?",
+        const="pplx-decider-flash-v1.2",
+        help="use Perplexity's Decisions API instead of Jev",
+    )
     parser.add_argument("--llm", metavar="MODEL", help="use an OpenAI vision model instead of Jev")
     args = parser.parse_args()
 
@@ -138,6 +147,11 @@ if __name__ == "__main__":
     elif args.google:
         classifier = GoogleDecisionsClassifier(
             api_key=os.environ["GOOGLE_API_KEY"], model=args.google
+        )
+        asyncio.run(main(classifier))
+    elif args.perplexity:
+        classifier = PerplexityDecisionsClassifier(
+            api_key=os.environ["PERPLEXITY_API_KEY"], model=args.perplexity
         )
         asyncio.run(main(classifier))
     elif args.llm:
