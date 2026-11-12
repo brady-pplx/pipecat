@@ -276,11 +276,21 @@ class PerplexityDecisionsClient:
         if not isinstance(pages, list):
             return []
         results = []
-        for page in pages:
+        for index, page in enumerate(pages):
             try:
                 results.append(PerplexitySearchResult.model_validate(page))
-            except ValidationError:
-                logger.debug(f"Perplexity Decisions sent a malformed page: {page!r}")
+            except ValidationError as e:
+                # A fetched page's snippet can be tens of thousands of
+                # characters, so the page itself, and the input pydantic
+                # quotes, are left out of the log.
+                url = page.get("url") if isinstance(page, dict) else None
+                problems = "; ".join(
+                    f"{'.'.join(map(str, error['loc'])) or 'page'}: {error['type']}"
+                    for error in e.errors(include_input=False, include_url=False)
+                )
+                logger.debug(
+                    f"Perplexity Decisions sent a malformed page {url or f'#{index}'}: {problems}"
+                )
         return results
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
