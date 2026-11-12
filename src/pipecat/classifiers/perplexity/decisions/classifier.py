@@ -68,6 +68,15 @@ class PerplexityDecisionsClassifier(BaseClassifier):
     :data:`PERPLEXITY_DECISIONS_MAX_IMAGE_TILES` tiles of 32x32 pixels, such
     as 1440x1440. They go ahead of the state, in the order given.
 
+    With ``web_grounding``, Perplexity searches the web before answering, and
+    the pages it read come to ``on_search_results`` after every call.
+
+    Event handlers available:
+
+    - on_metrics: See :class:`~pipecat.classifiers.base_classifier.BaseClassifier`.
+    - on_search_results: Called after every call with ``web_grounding``, with
+      the pages a search found and any page fetched from a URL in the state.
+
     ``pplx-decider-flash-v1.2``, the default, answers each question on its
     own and bills the state once per question. ``pplx-decider-v1.2`` answers
     the questions of a call together and bills the state once.
@@ -85,6 +94,7 @@ class PerplexityDecisionsClassifier(BaseClassifier):
         model: str = DEFAULT_MODEL,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT,
+        web_grounding: bool = False,
         **kwargs,
     ):
         """Initialize the classifier.
@@ -98,6 +108,9 @@ class PerplexityDecisionsClassifier(BaseClassifier):
             model: The decision model a client of its own asks.
             base_url: Where a client of its own sends its questions.
             timeout: Seconds a client of its own waits for an answer.
+            web_grounding: Whether a client of its own searches the web for
+                each question before the model answers. It adds up to about
+                three seconds, too long for most decisions within a turn.
             **kwargs: Additional arguments passed to the parent class.
         """
         super().__init__(**kwargs)
@@ -112,8 +125,11 @@ class PerplexityDecisionsClassifier(BaseClassifier):
                 model=model,
                 base_url=base_url,
                 timeout=timeout,
+                web_grounding=web_grounding,
             )
         self._client = client
+
+        self._register_event_handler("on_search_results")
 
     @property
     def client(self) -> PerplexityDecisionsClient:
@@ -152,9 +168,14 @@ class PerplexityDecisionsClassifier(BaseClassifier):
         if images:
             # The model reads each image part where it appears in the state.
             state = [*(self._image_part(image) for image in images), state]
-        answers, usage = await self._client.ask(
+        reply = await self._client.request(
             state, {name: self._to_perplexity(q) for name, q in questions.items()}
         )
+        if self._client.web_grounding:
+            await self._call_event_handler(
+                "on_search_results", reply.search_results, reply.fetched_results
+            )
+        answers, usage = reply.answers, reply.usage
         results = {
             name: self._from_perplexity(question, answers[name])
             for name, question in questions.items()

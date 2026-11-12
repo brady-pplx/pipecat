@@ -22,6 +22,7 @@ from pipecat.classifiers.base_classifier import (
     ClassifierImage,
     ScoreQuestion,
     YesNoQuestion,
+    YesNoResult,
 )
 from pipecat.classifiers.perplexity.decisions.classifier import (
     PERPLEXITY_DECISIONS_MAX_CHOICE_OPTIONS,
@@ -114,6 +115,25 @@ class TestPerplexityDecisionsClient:
             "questions": {"answer": {"type": "noul", "instructions": "a greeting?"}},
         }
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_web_grounding_sets_the_mode_and_staleness(self):
+        bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return _reply(answer=_noul(0.9))
+
+        grounded = _client(handler, web_grounding=True, max_staleness=86400)
+        await grounded.ask("https://example.com", NOUL)
+        # Staleness alone does nothing without web grounding, so it isn't sent.
+        plain = _client(handler, max_staleness=86400)
+        await plain.ask("a", NOUL)
+
+        assert (bodies[0]["mode"], bodies[0]["max_staleness"]) == ("web_grounding", 86400)
+        assert "mode" not in bodies[1] and "max_staleness" not in bodies[1]
+        await grounded.close()
+        await plain.close()
 
     @pytest.mark.asyncio
     async def test_counts_tokens_over_requests(self):
@@ -549,10 +569,11 @@ class TestPerplexityDecisionsClassifier:
 
     def test_a_client_of_its_own_takes_its_settings(self):
         classifier = PerplexityDecisionsClassifier(
-            api_key="key", model="pplx-decider-v1.2", timeout=1.5
+            api_key="key", model="pplx-decider-v1.2", timeout=1.5, web_grounding=True
         )
         assert classifier.model == "pplx-decider-v1.2"
         assert classifier.client._http.timeout.read == 1.5
+        assert classifier.client.web_grounding
 
     @pytest.mark.asyncio
     async def test_cleanup_closes_only_an_owned_client(self):
@@ -565,6 +586,50 @@ class TestPerplexityDecisionsClassifier:
         await classifier.cleanup()
         assert not shared._http.is_closed
         await shared.close()
+
+    @pytest.mark.asyncio
+    async def test_search_results_come_to_the_event_only_with_web_grounding(self):
+        page = {"title": "Sam", "url": "https://example.com", "snippet": "hi", "date": None}
+        reply = {
+            "model": "pplx-decider-flash-v1.2",
+            "answers": {"answer": _noul(0.9)},
+            "usage": USAGE,
+            # Malformed pages are left out rather than failing the answers.
+            "search_results": [page, {"title": "no url"}, {"title": None, "url": "https://x"}],
+            "fetched_results": [],
+        }
+
+        async def ask(web_grounding: bool) -> tuple[list, YesNoResult]:
+            client = _client(lambda request: httpx.Response(200, json=reply))
+            client._web_grounding = web_grounding
+            classifier = PerplexityDecisionsClassifier(client=client)
+            searched, measured = asyncio.Event(), asyncio.Event()
+            seen = []
+
+            @classifier.event_handler("on_search_results")
+            async def on_search_results(classifier, search_results, fetched_results):
+                seen.append((search_results, fetched_results))
+                searched.set()
+
+            @classifier.event_handler("on_metrics")
+            async def on_metrics(classifier, data):
+                measured.set()
+
+            results = await classifier.yes_no(
+                "a", {"answer": YesNoQuestion(instructions="a greeting?")}
+            )
+            # Without grounding there is no search event: the metrics event,
+            # which comes after it, shows the call is over.
+            await asyncio.wait_for((searched if web_grounding else measured).wait(), 1)
+            await client.close()
+            return seen, results["answer"]
+
+        [(search_results, fetched_results)], answer = await ask(web_grounding=True)
+        assert [result.url for result in search_results] == ["https://example.com"]
+        assert fetched_results == []
+        assert answer.probability == 0.9
+        seen, _ = await ask(web_grounding=False)
+        assert seen == []
 
     @pytest.mark.asyncio
     async def test_every_call_reports_its_time_and_tokens(self):
